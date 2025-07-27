@@ -1,0 +1,950 @@
+import discord
+import aiohttp
+import os
+import random
+import json
+import yt_dlp
+import asyncio
+import time
+import shutil
+import signal
+import subprocess
+from datetime import datetime
+from discord import app_commands
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+TMDB_API_KEY = os.getenv('TMDB_API_KEY')
+OWNER_ID = os.getenv('OWNER_ID', '0')
+FFMPEG_PATH = os.getenv('FFMPEG_PATH', 'ffmpeg')  # Added FFmpeg path configuration
+
+# Check FFmpeg availability
+def ffmpeg_check():
+    if shutil.which(FFMPEG_PATH) is None:
+        print(f"⚠️ FFmpeg not found at '{FFMPEG_PATH}'. Trying to find in PATH...")
+        if shutil.which("ffmpeg") is None:
+            print("❌ FFmpeg not found in PATH. Audio features will not work.")
+            return False
+        else:
+            print("✅ Found ffmpeg in system PATH")
+            return True
+    print(f"✅ Found ffmpeg at {FFMPEG_PATH}")
+    return True
+
+if not DISCORD_TOKEN:
+    raise ValueError("Missing DISCORD_TOKEN environment variable")
+
+# YouTube DL options for audio extraction
+YTDL_OPTIONS = {
+    'format': 'bestaudio/best',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0',
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'mp3',
+        'preferredquality': '192',
+    }],
+}
+
+# FFMPEG options for audio streaming (Opus optimized) with executable path
+FFMPEG_OPTIONS = {
+    'executable': FFMPEG_PATH,
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin',
+    'options': '-vn -b:a 256k -filter:a "volume=0.8"',
+}
+
+# Weather condition mapping (WMO codes)
+WEATHER_CODES = {
+    0: "☀️ Clear sky",
+    1: "🌤️ Mainly clear",
+    2: "⛅ Partly cloudy",
+    3: "☁️ Overcast",
+    45: "🌫️ Fog",
+    48: "🌫️ Rime fog",
+    51: "🌧️ Light drizzle",
+    53: "🌧️ Moderate drizzle",
+    55: "🌧️ Dense drizzle",
+    56: "🌧️❄️ Light freezing drizzle",
+    57: "🌧️❄️ Dense freezing drizzle",
+    61: "🌧️ Slight rain",
+    63: "🌧️ Moderate rain",
+    65: "🌧️ Heavy rain",
+    66: "🌧️❄️ Light freezing rain",
+    67: "🌧️❄️ Heavy freezing rain",
+    71: "❄️ Slight snow",
+    73: "❄️ Moderate snow",
+    75: "❄️ Heavy snow",
+    77: "❄️ Snow grains",
+    80: "🌦️ Slight rain showers",
+    81: "🌦️ Moderate rain showers",
+    82: "🌦️ Violent rain showers",
+    85: "🌨️ Slight snow showers",
+    86: "🌨️ Heavy snow showers",
+    95: "⛈️ Thunderstorm",
+    96: "⛈️💧 Thunderstorm with slight hail",
+    99: "⛈️🧊 Thunderstorm with heavy hail"
+}
+
+class Song:
+    """Class to represent a song in the queue"""
+    __slots__ = ('source', 'title', 'url', 'duration', 'requester')
+    
+    def __init__(self, source, data: dict, requester: discord.Member):
+        self.source = source
+        self.title = data.get('title', 'Unknown Title')
+        self.url = data.get('webpage_url', data.get('url'))
+        self.duration = data.get('duration', 0)
+        self.requester = requester
+
+class GuildMusicState:
+    """Class to manage music state for each guild"""
+    __slots__ = ('queue', 'current', 'voice_client', 'loop', 'text_channel', 'keepalive', 'ffmpeg_process')
+    
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.current = None
+        self.voice_client = None
+        self.loop = False
+        self.text_channel = None
+        self.keepalive = None
+        self.ffmpeg_process = None  # Track FFmpeg process
+        
+    def is_playing(self):
+        return self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused())
+    
+    def clear(self):
+        self.queue = asyncio.Queue()
+        self.current = None
+        self.loop = False
+        self.terminate_ffmpeg()
+        
+    def terminate_ffmpeg(self):
+        """Force terminate any running FFmpeg process"""
+        if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
+            try:
+                print("Terminating FFmpeg process...")
+                # Try graceful termination first
+                self.ffmpeg_process.terminate()
+                
+                # Wait for a short time before killing
+                try:
+                    self.ffmpeg_process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    print("FFmpeg didn't terminate, killing process...")
+                    self.ffmpeg_process.kill()
+            except Exception as e:
+                print(f"Error terminating FFmpeg: {e}")
+            finally:
+                self.ffmpeg_process = None
+
+class MyClient(discord.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.tree = app_commands.CommandTree(self)
+        self.session = None
+        self.nominatim_headers = {'User-Agent': 'DiscordWeatherBot/1.0 (non-profit educational project)'}
+        self.user_locations = self.load_user_locations()
+        self.music_states = {}  # guild_id: GuildMusicState
+        self.sync_task = None
+        self.ffmpeg_available = ffmpeg_check()
+        
+        # Updated genre mapping with reliable combinations
+        self.genre_mapping = {
+            "happy": [35, 10402],     # Comedy, Music
+            "sad": [18, 10751],       # Drama, Family
+            "excited": [28, 12],      # Action, Adventure
+            "scared": [27],           # Horror
+            "thoughtful": [9648, 18]  # Mystery, Drama
+        }
+
+    async def close(self):
+        # Clean up all FFmpeg processes before shutting down
+        for state in self.music_states.values():
+            state.terminate_ffmpeg()
+            
+        if self.session and not self.session.closed:
+            await self.session.close()
+        if self.sync_task:
+            self.sync_task.cancel()
+        await super().close()
+        
+    def load_user_locations(self):
+        try:
+            with open('user_locations.json', 'r') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def save_user_locations(self):
+        with open('user_locations.json', 'w') as f:
+            json.dump(self.user_locations, f)
+
+    async def setup_hook(self):
+        self.session = aiohttp.ClientSession()
+        try:
+            synced = await self.tree.sync()
+            print(f"Synced {len(synced)} commands!")
+        except discord.HTTPException as e:
+            print(f"Failed to sync commands: {e}")
+
+    async def on_ready(self):
+        print(f'Logged on as {self.user} (ID: {self.user.id})')
+        # Changed to ActivityType.listening for better presence
+        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="/help"))
+        
+        # Start periodic command syncing
+        self.sync_task = self.loop.create_task(self.periodic_sync())
+        
+    async def periodic_sync(self):
+        """Periodically sync commands to prevent Unknown Integration errors"""
+        await self.wait_until_ready()
+        while not self.is_closed():
+            try:
+                synced = await self.tree.sync()
+                print(f"Periodic sync: Updated {len(synced)} commands")
+            except discord.HTTPException as e:
+                print(f"Periodic sync error: {e}")
+            await asyncio.sleep(300)  # Sync every 5 minutes
+
+    def get_music_state(self, guild: discord.Guild) -> GuildMusicState:
+        """Get or create music state for a guild"""
+        if guild.id not in self.music_states:
+            self.music_states[guild.id] = GuildMusicState()
+        return self.music_states[guild.id]
+
+    async def yt_dl(self, query: str) -> dict:
+        """Fetch audio source using yt-dlp"""
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(YTDL_OPTIONS).extract_info(query, download=False))
+        
+        if 'entries' in data:
+            data = data['entries'][0]
+        return data
+
+    async def play_next(self, guild: discord.Guild):
+        """Play next song in the queue"""
+        if not self.ffmpeg_available:
+            print("❌ FFmpeg not available - cannot play audio")
+            return
+            
+        state = self.get_music_state(guild)
+        
+        if state.loop and state.current:
+            # Re-add current song to queue if looping
+            await state.queue.put(state.current)
+        
+        if state.queue.empty():
+            state.current = None
+            # Auto leave after 5 minutes of inactivity
+            if state.voice_client:
+                await asyncio.sleep(300)
+                if not state.is_playing() and state.queue.empty():
+                    await state.voice_client.disconnect()
+                    state.voice_client = None
+                    state.clear()
+            return
+            
+        # Get next song
+        state.current = await state.queue.get()
+        
+        # Play the source
+        try:
+            # Terminate any existing FFmpeg process
+            state.terminate_ffmpeg()
+            
+            # Use Opus for better quality and reliability
+            source = discord.FFmpegOpusAudio(
+                state.current.source['url'],
+                **FFMPEG_OPTIONS
+            )
+            
+            # Create a wrapper to capture the FFmpeg process
+            def after_playing(error):
+                # Clean up the FFmpeg process when done
+                state.terminate_ffmpeg()
+                
+                # Schedule the next song
+                asyncio.run_coroutine_threadsafe(self.play_next(guild), self.loop)
+            
+            # Play the audio with our custom after handler
+            state.voice_client.play(source, after=after_playing)
+            
+            # Store the FFmpeg process for later termination if needed
+            if hasattr(source, '_process'):
+                state.ffmpeg_process = source._process
+                print(f"Started FFmpeg process: PID {state.ffmpeg_process.pid}")
+                
+        except Exception as e:
+            print(f"Error playing audio: {e}")
+            if state.text_channel:
+                await state.text_channel.send(f"❌ Error playing audio: {e}")
+            return
+        
+        # Send now playing message
+        if state.text_channel:
+            mins, secs = divmod(state.current.duration, 60)
+            duration_str = f"{int(mins)}:{int(secs):02d}" if state.current.duration > 0 else "Live"
+            embed = discord.Embed(
+                title="🎶 Now Playing",
+                description=f"[{state.current.title}]({state.current.url})",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Duration", value=duration_str, inline=True)
+            embed.add_field(name="Requested by", value=state.current.requester.mention, inline=True)
+            try:
+                await state.text_channel.send(embed=embed)
+            except discord.HTTPException:
+                pass  # Ignore message errors
+
+    async def connect_with_retry(self, channel: discord.VoiceChannel, state: GuildMusicState, max_retries: int = 3):
+        """Connect to voice channel with retry logic for 4006 errors"""
+        for attempt in range(max_retries):
+            try:
+                # Try to connect or move
+                if state.voice_client:
+                    if state.voice_client.channel == channel:
+                        return state.voice_client
+                    await state.voice_client.move_to(channel)
+                else:
+                    state.voice_client = await channel.connect(
+                        timeout=15,
+                        reconnect=True,
+                        self_deaf=True  # Bot deafens itself to avoid echo
+                    )
+                    
+                    # Ensure bot is not muted
+                    await asyncio.sleep(0.5)  # Small delay to let connection stabilize
+                    if state.voice_client.is_connected():
+                        # Check if bot is server-muted
+                        voice_state = channel.guild.me.voice
+                        if voice_state and voice_state.mute:
+                            await state.text_channel.send("⚠️ I'm muted! Please unmute me to play audio.")
+                return state.voice_client
+            except discord.HTTPException as e:
+                if e.status == 4006 and attempt < max_retries - 1:
+                    wait = 2 ** attempt  # Exponential backoff
+                    print(f"Voice connection failed (attempt {attempt+1}), retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                    
+                    # Reset voice state
+                    if state.voice_client:
+                        try:
+                            await state.voice_client.disconnect()
+                        except:
+                            pass
+                        state.voice_client = None
+                else:
+                    raise
+
+    async def get_meme(self):
+        try:
+            async with self.session.get('https://meme-api.com/gimme') as response:
+                data = await response.json()
+                return data['url'], None
+        except (aiohttp.ClientError, KeyError) as e:
+            return None, f"🚫 Failed to get meme: {type(e).__name__}"
+
+    async def get_quote(self):
+        """Robust quote fetching with multiple fallback APIs"""
+        quote_apis = [
+            'https://api.quotable.io/random',
+            'https://zenquotes.io/api/random',
+            'https://api.forismatic.com/api/1.0/?method=getQuote&format=json&lang=en'
+        ]
+        
+        for api_url in quote_apis:
+            try:
+                async with self.session.get(api_url, timeout=3) as response:
+                    data = await response.json()
+                    
+                    # Handle different API response formats
+                    if api_url == 'https://zenquotes.io/api/random':
+                        quote = data[0]['q']
+                        author = data[0]['a']
+                    elif api_url == 'https://api.forismatic.com/api/1.0/':
+                        quote = data['quoteText'].strip()
+                        author = data['quoteAuthor'] or "Unknown"
+                    else:  # Default quotable.io format
+                        quote = data['content']
+                        author = data['author']
+                    
+                    return f"\"{quote}\"\n- {author}", None
+                    
+            except (aiohttp.ClientError, KeyError, IndexError, json.JSONDecodeError):
+                continue  # Try next API if this one fails
+                
+        return None, "🚫 All quote services are unavailable right now"
+
+    async def geocode_location(self, location: str):
+        """Convert location string to coordinates"""
+        try:
+            geocode_url = 'https://nominatim.openstreetmap.org/search'
+            params = {'q': location, 'format': 'json', 'limit': 1}
+            async with self.session.get(geocode_url, params=params, headers=self.nominatim_headers) as response:
+                geo_data = await response.json()
+                if not geo_data:
+                    return None, "📍 Location not found"
+                
+                lat = geo_data[0]['lat']
+                lon = geo_data[0]['lon']
+                display_name = geo_data[0]['display_name']
+                
+                return (lat, lon, display_name), None
+        except (aiohttp.ClientError, KeyError, IndexError) as e:
+            return None, f"🚫 Geocoding error: {type(e).__name__}"
+
+    async def get_weather_data(self, lat: str, lon: str):
+        """Get weather data from Open-Meteo API"""
+        try:
+            weather_url = 'https://api.open-meteo.com/v1/forecast'
+            weather_params = {
+                'latitude': lat,
+                'longitude': lon,
+                'current': 'temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code',
+                'daily': 'temperature_2m_max,temperature_2m_min,weather_code',
+                'wind_speed_unit': 'ms',
+                'timezone': 'auto',
+                'forecast_days': 1
+            }
+            async with self.session.get(weather_url, params=weather_params) as response:
+                weather_data = await response.json()
+                
+                if 'error' in weather_data:
+                    return None, weather_data['reason']
+                
+                return weather_data, None
+        except (aiohttp.ClientError, KeyError) as e:
+            return None, f"🚫 Weather API error: {type(e).__name__}"
+
+    async def get_weather(self, location: str, user_id: str = None):
+        """Get weather for a location with enhanced formatting"""
+        try:
+            # Check if user has a saved location
+            if user_id and user_id in self.user_locations:
+                lat, lon, display_name = self.user_locations[user_id]
+            else:
+                # Geocode new location
+                geocode_result, error = await self.geocode_location(location)
+                if error:
+                    return None, error
+                lat, lon, display_name = geocode_result
+                
+                # Save new location for user
+                if user_id:
+                    self.user_locations[user_id] = (lat, lon, display_name)
+                    self.save_user_locations()
+            
+            # Get weather data
+            weather_data, error = await self.get_weather_data(lat, lon)
+            if error:
+                return None, error
+            
+            current = weather_data['current']
+            daily = weather_data['daily']
+            
+            # Get emoji for weather code
+            weather_emoji = WEATHER_CODES.get(current['weather_code'], "🌡️")
+            
+            # Format date
+            today = datetime.now().strftime("%A, %B %d")
+            
+            # Create weather report
+            return (
+                f"## {weather_emoji} Weather in {display_name}\n"
+                f"### {today}\n"
+                f"**Conditions**: {WEATHER_CODES[current['weather_code']].split(' ', 1)[1]}\n"
+                f"🌡️ **Temperature**: {current['temperature_2m']}°C\n"
+                f"↕️ **Daily Range**: {daily['temperature_2m_min'][0]}°C - {daily['temperature_2m_max'][0]}°C\n"
+                f"💧 **Humidity**: {current['relative_humidity_2m']}%\n"
+                f"💨 **Wind**: {current['wind_speed_10m']} m/s\n\n"
+                f"_Data from Open-Meteo • Location via OpenStreetMap_"
+            ), None
+                
+        except (KeyError, IndexError, TypeError) as e:
+            return None, f"🚫 Weather processing error: {type(e).__name__}"
+
+    async def get_movie(self, mood: str = "random"):
+        """Robust movie recommendation with fallback logic"""
+        try:
+            # Define base API parameters
+            params = {
+                'api_key': TMDB_API_KEY,
+                'sort_by': 'popularity.desc',
+                'include_adult': 'false',
+                'vote_count.gte': 10,  # Very low threshold
+                'page': random.randint(1, 10)  # Focused page range
+            }
+            
+            # Get genre IDs for mood if not random
+            if mood != "random":
+                genre_ids = self.genre_mapping.get(mood, [])
+                if genre_ids:
+                    # Use OR logic instead of AND for genres
+                    params['with_genres'] = "|".join(map(str, genre_ids))
+            
+            # Get movie list
+            url = 'https://api.themoviedb.org/3/discover/movie'
+            async with self.session.get(url, params=params) as response:
+                data = await response.json()
+                
+                # If no results, try without genre filter
+                if not data.get('results'):
+                    if 'with_genres' in params:
+                        params.pop('with_genres')
+                        async with self.session.get(url, params=params) as fallback_response:
+                            data = await fallback_response.json()
+                    
+                    if not data.get('results'):
+                        return None, "🎬 No movies found. Try a different mood!"
+                
+                # Filter valid movies with posters
+                valid_movies = [m for m in data['results'] if m.get('poster_path')]
+                if not valid_movies:
+                    return None, "🎬 No movies with posters found. Try again!"
+                
+                movie = random.choice(valid_movies)
+                
+                # Get movie details
+                detail_url = f'https://api.themoviedb.org/3/movie/{movie["id"]}'
+                async with self.session.get(detail_url, params={'api_key': TMDB_API_KEY}) as detail_response:
+                    movie_data = await detail_response.json()
+                
+                # Format response
+                poster = f"https://image.tmdb.org/t/p/w500{movie['poster_path']}"
+                overview = movie['overview'][:200] + "..." if movie.get('overview') else "No description available"
+                release_year = movie['release_date'][:4] if movie.get('release_date') else "Unknown year"
+                genres = ", ".join([g['name'] for g in movie_data.get('genres', [])]) if movie_data.get('genres') else "Unknown"
+                
+                return (
+                    f"🎬 **{movie['title']}** ({release_year})\n"
+                    f"⭐ **Rating**: {movie['vote_average']}/10 • ⏱️ {movie_data.get('runtime', '?')} mins\n"
+                    f"🎭 **Genres**: {genres}\n"
+                    f"📝 **Plot**: {overview}\n"
+                    f"{poster}"
+                ), None
+                
+        except (aiohttp.ClientError, KeyError, IndexError) as e:
+            return None, f"🚫 Failed to get movie: {type(e).__name__}"
+
+# ==================== FIXED INTENTS CONFIGURATION ====================
+# Only enable necessary intents to avoid privileged intents error
+intents = discord.Intents.default()
+intents.voice_states = True  # Required for voice commands
+intents.members = True        # Required for member mentions in queue
+client = MyClient(intents=intents)
+# =====================================================================
+
+@client.tree.command(name="sync", description="Sync commands (owner only)")
+async def sync_commands(interaction: discord.Interaction):
+    """Manually sync commands to fix 'Unknown Integration' errors"""
+    if interaction.user.id != int(OWNER_ID):
+        return await interaction.response.send_message("❌ Owner only command!", ephemeral=True)
+    
+    try:
+        synced = await client.tree.sync()
+        await interaction.response.send_message(
+            f"✅ Synced {len(synced)} commands globally!",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.response.send_message(
+            f"❌ Sync failed: {e}",
+            ephemeral=True
+        )
+
+@client.tree.command(name="join", description="Join your voice channel")
+@app_commands.checks.cooldown(1, 5)  # Prevent command spam
+async def join_command(interaction: discord.Interaction):
+    """Make the bot join your voice channel with robust error handling"""
+    try:
+        # Immediately acknowledge the interaction
+        await interaction.response.defer()
+        
+        # Check if user is in a voice channel
+        if not interaction.user.voice:
+            return await interaction.followup.send("❌ You need to be in a voice channel!", ephemeral=True)
+        
+        state = client.get_music_state(interaction.guild)
+        channel = interaction.user.voice.channel
+        
+        # Check if bot is already in this channel
+        if state.voice_client and state.voice_client.channel == channel:
+            return await interaction.followup.send("✅ I'm already in your voice channel!")
+        
+        # Check permissions
+        permissions = channel.permissions_for(interaction.guild.me)
+        if not permissions.connect:
+            return await interaction.followup.send("❌ I need 'Connect' permission!", ephemeral=True)
+        if not permissions.speak:
+            return await interaction.followup.send("❌ I need 'Speak' permission!", ephemeral=True)
+        
+        # Connect with retry logic
+        try:
+            await client.connect_with_retry(channel, state)
+            state.text_channel = interaction.channel
+            
+            # Check if bot is muted
+            await asyncio.sleep(0.5)  # Small delay to let voice state update
+            voice_state = interaction.guild.me.voice
+            if voice_state and voice_state.mute:
+                await interaction.followup.send("⚠️ I'm muted! Please unmute me to play audio.")
+            else:
+                await interaction.followup.send(f"✅ Joined **{channel.name}**")
+        except discord.ClientException as e:
+            await interaction.followup.send(f"🔌 Connection error: {e}", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Unexpected error: {type(e).__name__}", ephemeral=True)
+            
+    except Exception as e:
+        print(f"Join command error: {e}")
+        if not interaction.is_expired():
+            try:
+                await interaction.followup.send("❌ An unexpected error occurred. Please try again.", ephemeral=True)
+            except:
+                pass
+
+@client.tree.command(name="leave", description="Leave the voice channel")
+async def leave_command(interaction: discord.Interaction):
+    """Make the bot leave the voice channel"""
+    state = client.get_music_state(interaction.guild)
+    
+    if not state.voice_client:
+        return await interaction.response.send_message("❌ I'm not in a voice channel!", ephemeral=True)
+    
+    # Clean up before disconnecting
+    state.terminate_ffmpeg()
+    await state.voice_client.disconnect()
+    state.voice_client = None
+    state.clear()
+    await interaction.response.send_message("✅ Left the voice channel")
+
+@client.tree.command(name="play", description="Play a song from YouTube")
+@app_commands.describe(query="Song name or YouTube URL")
+async def play_command(interaction: discord.Interaction, query: str):
+    """Play a song from YouTube"""
+    if not client.ffmpeg_available:
+        return await interaction.response.send_message("❌ Audio features disabled - FFmpeg not found", ephemeral=True)
+    
+    await interaction.response.defer()
+    
+    # Check voice connection
+    state = client.get_music_state(interaction.guild)
+    if not interaction.user.voice:
+        return await interaction.followup.send("❌ You need to be in a voice channel!")
+    
+    # Check if bot is muted
+    voice_state = interaction.guild.me.voice
+    if voice_state and voice_state.mute:
+        return await interaction.followup.send("⚠️ I'm muted! Please unmute me to play audio.")
+    
+    if not state.voice_client:
+        try:
+            await client.connect_with_retry(interaction.user.voice.channel, state)
+            state.text_channel = interaction.channel
+        except Exception as e:
+            return await interaction.followup.send(f"❌ Failed to connect: {e}")
+    
+    # Fetch song data
+    try:
+        data = await client.yt_dl(query)
+    except Exception as e:
+        return await interaction.followup.send(f"❌ Error fetching song: {e}")
+    
+    song = Song(data, data, interaction.user)
+    await state.queue.put(song)
+    
+    # Start playing if not already playing
+    if not state.is_playing():
+        await client.play_next(interaction.guild)
+        message = f"🎵 Now playing: **{song.title}**"
+    else:
+        mins, secs = divmod(song.duration, 60)
+        duration_str = f"{int(mins)}:{int(secs):02d}" if song.duration > 0 else "Live"
+        message = f"🎵 Added to queue: **{song.title}** ({duration_str})"
+    
+    await interaction.followup.send(message)
+
+@client.tree.command(name="skip", description="Skip the current song")
+async def skip_command(interaction: discord.Interaction):
+    """Skip the current song"""
+    state = client.get_music_state(interaction.guild)
+    
+    if not state.is_playing():
+        return await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
+    
+    # Clean up FFmpeg before skipping
+    state.terminate_ffmpeg()
+    state.voice_client.stop()
+    await interaction.response.send_message("⏭️ Skipped current song")
+
+@client.tree.command(name="stop", description="Stop playback and clear the queue")
+async def stop_command(interaction: discord.Interaction):
+    """Stop music and clear the queue"""
+    try:
+        state = client.get_music_state(interaction.guild)
+        
+        if not state.voice_client:
+            return await interaction.response.send_message("❌ I'm not in a voice channel!", ephemeral=True)
+        
+        # Clean up FFmpeg processes
+        state.terminate_ffmpeg()
+        
+        # Stop current playback
+        if state.voice_client.is_playing() or state.voice_client.is_paused():
+            state.voice_client.stop()
+        
+        # Clear the queue
+        state.clear()
+        
+        # Disconnect from voice
+        await state.voice_client.disconnect()
+        state.voice_client = None
+        
+        await interaction.response.send_message("⏹️ Stopped playback and cleared the queue")
+    except Exception as e:
+        print(f"Stop command error: {e}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(f"❌ Error stopping playback: {e}", ephemeral=True)
+
+@client.tree.command(name="pause", description="Pause the music")
+async def pause_command(interaction: discord.Interaction):
+    """Pause the music"""
+    state = client.get_music_state(interaction.guild)
+    
+    if not state.is_playing():
+        return await interaction.response.send_message("❌ Nothing is playing!", ephemeral=True)
+    
+    if state.voice_client.is_paused():
+        return await interaction.response.send_message("❌ Already paused!", ephemeral=True)
+    
+    state.voice_client.pause()
+    await interaction.response.send_message("⏸️ Paused music")
+
+@client.tree.command(name="resume", description="Resume paused music")
+async def resume_command(interaction: discord.Interaction):
+    """Resume paused music"""
+    state = client.get_music_state(interaction.guild)
+    
+    if not state.voice_client:
+        return await interaction.response.send_message("❌ Not in a voice channel!", ephemeral=True)
+    
+    if state.voice_client.is_playing():
+        return await interaction.response.send_message("❌ Already playing!", ephemeral=True)
+    
+    state.voice_client.resume()
+    await interaction.response.send_message("▶️ Resumed music")
+
+@client.tree.command(name="queue", description="Show the current queue")
+async def queue_command(interaction: discord.Interaction):
+    """Show the current queue"""
+    state = client.get_music_state(interaction.guild)
+    
+    if state.queue.empty() and not state.current:
+        return await interaction.response.send_message("❌ Queue is empty!", ephemeral=True)
+    
+    embed = discord.Embed(title="🎵 Music Queue", color=discord.Color.blue())
+    
+    # Add current song
+    if state.current:
+        mins, secs = divmod(state.current.duration, 60)
+        duration_str = f"{int(mins)}:{int(secs):02d}" if state.current.duration > 0 else "Live"
+        embed.add_field(
+            name="Now Playing",
+            value=f"[{state.current.title}]({state.current.url})\n"
+                  f"Duration: {duration_str} • Requested by: {state.current.requester.mention}",
+            inline=False
+        )
+    
+    # Add queued songs
+    queue_items = []
+    for i, song in enumerate(state.queue._queue, 1):
+        mins, secs = divmod(song.duration, 60)
+        duration_str = f"{int(mins)}:{int(secs):02d}" if song.duration > 0 else "Live"
+        queue_items.append(f"{i}. [{song.title}]({song.url}) ({duration_str}) • {song.requester.mention}")
+    
+    if queue_items:
+        embed.add_field(
+            name="Up Next",
+            value="\n".join(queue_items[:5]) + (f"\n...and {len(queue_items)-5} more" if len(queue_items) > 5 else ""),
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed)
+
+@client.tree.command(name="loop", description="Toggle looping for the current song")
+async def loop_command(interaction: discord.Interaction):
+    """Toggle looping for the current song"""
+    state = client.get_music_state(interaction.guild)
+    state.loop = not state.loop
+    status = "✅ Enabled" if state.loop else "❌ Disabled"
+    await interaction.response.send_message(f"{status} looping")
+
+@client.tree.command(name="meme", description="Get a random meme")
+async def meme_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    meme, error = await client.get_meme()
+    await (interaction.followup.send(meme) if meme else interaction.followup.send(error))
+
+@client.tree.command(name="quote", description="Get an inspirational quote")
+async def quote_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    quote, error = await client.get_quote()
+    await (interaction.followup.send(quote) if quote else interaction.followup.send(error))
+
+@client.tree.command(name="weather", description="Get weather for a location")
+@app_commands.describe(
+    location="City name or address (optional if you've set a location)",
+    save="Save this as your default location?"
+)
+async def weather_command(interaction: discord.Interaction, location: str = None, save: bool = False):
+    await interaction.response.defer()
+    
+    user_id = str(interaction.user.id)
+    
+    # If no location provided but user has saved location
+    if not location and user_id in client.user_locations:
+        _, _, display_name = client.user_locations[user_id]
+        location = display_name
+    
+    if not location:
+        return await interaction.followup.send("Please provide a location or set a default with `/setlocation`")
+    
+    weather, error = await client.get_weather(location, user_id if save else None)
+    if save and not error:
+        message = f"✅ Location saved! {weather}"
+    else:
+        message = weather if weather else error
+    
+    await interaction.followup.send(message)
+
+@client.tree.command(name="setlocation", description="Set your default location for weather")
+@app_commands.describe(location="Your city or address")
+async def set_location_command(interaction: discord.Interaction, location: str):
+    await interaction.response.defer()
+    
+    user_id = str(interaction.user.id)
+    geocode_result, error = await client.geocode_location(location)
+    
+    if error:
+        return await interaction.followup.send(error)
+    
+    lat, lon, display_name = geocode_result
+    client.user_locations[user_id] = (lat, lon, display_name)
+    client.save_user_locations()
+    
+    await interaction.followup.send(f"✅ Your default location has been set to: **{display_name}**")
+
+@client.tree.command(name="mylocation", description="Show your saved weather location")
+async def my_location_command(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    if user_id in client.user_locations:
+        _, _, display_name = client.user_locations[user_id]
+        await interaction.response.send_message(f"📍 Your saved location is: **{display_name}**")
+    else:
+        await interaction.response.send_message("You haven't set a default location yet. Use `/setlocation` to set one.")
+
+@client.tree.command(name="movie", description="Get a movie recommendation")
+@app_commands.describe(mood="Your current mood for movie suggestions")
+@app_commands.choices(mood=[
+    app_commands.Choice(name="😄 Happy", value="happy"),
+    app_commands.Choice(name="😢 Sad", value="sad"),
+    app_commands.Choice(name="🤩 Excited", value="excited"),
+    app_commands.Choice(name="😨 Scared", value="scared"),
+    app_commands.Choice(name="🤔 Thoughtful", value="thoughtful"),
+    app_commands.Choice(name="🎲 Random", value="random")
+])
+async def movie_command(interaction: discord.Interaction, mood: str = "random"):
+    await interaction.response.defer()
+    movie, error = await client.get_movie(mood)
+    await (interaction.followup.send(movie) if movie else interaction.followup.send(error))
+
+@client.tree.command(name="help", description="Show available commands")
+async def help_command(interaction: discord.Interaction):
+    try:
+        embed = discord.Embed(
+            title="🤖 Weather & Movie Bot Commands",
+            description="Here are all the available commands:",
+            color=0x3498db
+        )
+        
+        commands = [
+            ("/meme", "Get a random meme", False),
+            ("/quote", "Get an inspirational quote", False),
+            ("/weather [location]", "Get weather information (save with `save=True`)", False),
+            ("/setlocation [location]", "Set your default weather location", False),
+            ("/mylocation", "Show your saved weather location", False),
+            ("/movie [mood]", "Get movie recommendation based on mood", False),
+            ("/help", "Show this help message", False),
+            ("/join", "Join your voice channel", False),
+            ("/play [query]", "Play music from YouTube", False),
+            ("/pause", "Pause playback", False),
+            ("/resume", "Resume playback", False),
+            ("/skip", "Skip current song", False),
+            ("/stop", "Stop playback and clear queue", False),
+            ("/queue", "Show current queue", False),
+            ("/loop", "Toggle song looping", False),
+            ("/leave", "Leave voice channel", False)
+        ]
+        
+        for name, value, inline in commands:
+            embed.add_field(name=name, value=value, inline=inline)
+        
+        embed.add_field(
+            name="Movie Mood Options", 
+            value="😄 Happy: Comedy/Musical\n"
+                  "😢 Sad: Drama/Family\n"
+                  "🤩 Excited: Action/Adventure\n"
+                  "😨 Scared: Horror\n"
+                  "🤔 Thoughtful: Mystery/Drama\n"
+                  "🎲 Random: Any popular movie",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="Music Features", 
+            value="• Ad-free YouTube streaming\n"
+                  "• Persistent queue system\n"
+                  "• Auto-disconnect after inactivity\n"
+                  "• High-quality audio",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+    except discord.HTTPException:
+        # Fallback to simple message if embed fails
+        simple_help = (
+            "**🤖 Bot Commands:**\n"
+            "/meme - Get a random meme\n"
+            "/quote - Get a quote\n"
+            "/weather - Get weather info\n"
+            "/setlocation - Save your location\n"
+            "/mylocation - Show saved location\n"
+            "/movie - Movie recommendations\n"
+            "/help - This message\n\n"
+            "**🎵 Music Commands:**\n"
+            "/join - Join voice channel\n"
+            "/play - Play music\n"
+            "/pause - Pause music\n"
+            "/resume - Resume music\n"
+            "/skip - Skip current song\n"
+            "/stop - Stop playback and clear queue\n"
+            "/queue - Show queue\n"
+            "/loop - Toggle looping\n"
+            "/leave - Leave voice channel"
+        )
+        await interaction.response.send_message(simple_help)
+
+client.run(DISCORD_TOKEN)
